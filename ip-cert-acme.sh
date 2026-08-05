@@ -133,11 +133,6 @@ is_ipv4() {
     done
 }
 
-is_ipv6() {
-    local ip="$1"
-    [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:]+$ ]]
-}
-
 detect_public_ipv4() {
     local url=""
     local result=""
@@ -158,7 +153,6 @@ detect_public_ipv4() {
 }
 
 SELECTED_IPV4=""
-SELECTED_IPV6=""
 
 select_ips() {
     local detected=""
@@ -173,17 +167,7 @@ select_ips() {
     fi
     is_ipv4 "$input" || { error "IPv4 格式无效：$input"; return 1; }
     SELECTED_IPV4="$input"
-
-    read -r -p "可选：请输入需要加入同一证书的公网 IPv6（没有则留空）：" input
-    if [[ -n "$input" ]]; then
-        is_ipv6 "$input" || { error "IPv6 格式无效：$input"; return 1; }
-        SELECTED_IPV6="$input"
-    else
-        SELECTED_IPV6=""
-    fi
-
     info "证书主标识：${SELECTED_IPV4}"
-    [[ -n "$SELECTED_IPV6" ]] && info "附加标识：${SELECTED_IPV6}"
 }
 
 port_80_in_use() {
@@ -220,7 +204,6 @@ ensure_port_80_free() {
 
 build_domain_args() {
     DOMAIN_ARGS=(-d "$SELECTED_IPV4")
-    [[ -n "$SELECTED_IPV6" ]] && DOMAIN_ARGS+=(-d "$SELECTED_IPV6")
 }
 
 run_staging_test() {
@@ -326,7 +309,6 @@ write_state() {
     umask 077
     {
         printf 'PRIMARY_IP=%q\n' "$SELECTED_IPV4"
-        printf 'SECONDARY_IPV6=%q\n' "$SELECTED_IPV6"
         printf 'CERT_DIR=%q\n' "$cert_dir"
         printf 'RELOAD_COMMAND=%q\n' "$reload_command"
     } >"$STATE_FILE"
@@ -384,7 +366,6 @@ install_certificate_files() {
 
 load_state() {
     PRIMARY_IP=""
-    SECONDARY_IPV6=""
     CERT_DIR="$DEFAULT_CERT_DIR"
     RELOAD_COMMAND=""
     if [[ -r "$STATE_FILE" ]]; then
@@ -400,9 +381,7 @@ show_status() {
     printf '脚本版本：%s\n' "$SCRIPT_VERSION"
     printf 'acme.sh：%s\n' "$ACME_BIN"
     if [[ -n "$PRIMARY_IP" ]]; then
-        printf '已保存的证书 IP：%s' "$PRIMARY_IP"
-        [[ -n "$SECONDARY_IPV6" ]] && printf '，%s' "$SECONDARY_IPV6"
-        printf '\n'
+        printf '已保存的证书 IP：%s\n' "$PRIMARY_IP"
     fi
 
     if [[ -x "$ACME_BIN" ]]; then
