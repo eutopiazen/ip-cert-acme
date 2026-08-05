@@ -1,15 +1,15 @@
 # IP Certificate ACME
 
 一个面向 Debian/Ubuntu 的交互式 Bash 工具，使用
-[acme.sh](https://github.com/acmesh-official/acme.sh) 为公网 IPv4（可附加
-IPv6）申请 Let’s Encrypt 短期 IP 证书，并配置自动续期。
+[acme.sh](https://github.com/acmesh-official/acme.sh) 为公网 IPv4 申请
+Let’s Encrypt 短期 IP 证书，并配置自动续期。
 
 > Let’s Encrypt 的 IP 证书有效期约 6 天。稳定的自动续期不是可选项：公网
 > TCP 80、cron、固定证书路径和服务重载命令必须同时正常。
 
 ## 功能
 
-- 自动识别或手动输入公网 IPv4，可附加 IPv6
+- 自动识别或手动输入公网 IPv4
 - 安装 `acme.sh`、`socat`、`cron`、OpenSSL 等依赖
 - 使用独立临时目录完成 staging 测试，不污染正式证书配置
 - 使用 Let’s Encrypt `shortlived` profile 正式签发 IP 证书
@@ -24,7 +24,7 @@ IPv6）申请 Let’s Encrypt 短期 IP 证书，并配置自动续期。
 - Debian 12
 - Ubuntu 22.04/24.04
 - root 权限
-- 公网 IPv4；可选择在同一证书中加入公网 IPv6
+- 单个公网 IPv4
 - HTTP-01 standalone 验证
 
 其他发行版暂未测试，脚本会拒绝自动修改。
@@ -131,6 +131,9 @@ systemctl reload nginx
 
 菜单 `5` 只执行正常 cron 检查；未到续期窗口会安全跳过。菜单 `6` 会强制创建
 新订单并消耗 CA 速率限额，因此要求输入 `RENEW` 二次确认。
+
+当前版本不处理 IPv6、同一证书包含多个 IP、多节点共享证书或 TCP 80 长期被
+Web 服务占用的场景；这些情况需要按实际架构改用其他监听或验证方案。
 
 ## 重要说明
 
