@@ -15,7 +15,11 @@ Let’s Encrypt 短期 IP 证书，并配置自动续期。
 - 使用 Let’s Encrypt `shortlived` profile 正式签发 IP 证书
 - 默认第 4 天进入续期判断，给约 6 天的证书保留容错时间
 - 将证书部署到固定路径，而不是让服务读取 acme.sh 内部目录
-- 续期成功后自动重启或重载 x-ui、Nginx、Caddy、Apache2 或自定义服务
+- 内置多目标部署分发器，一次续期可同步到多个使用者
+- 自动发现 1Panel 面板证书，不绑定 1Panel 版本号或固定安装目录
+- 可选择 1Panel 网站、x-ui、Nginx、Caddy、Apache2 或自定义目标
+- 复制前校验证书与私钥，保留目标备份并使用同目录临时文件原子替换
+- 单个复制目标重载失败时自动恢复旧证书并再次尝试恢复服务
 - 查看 cron、ARI/下次续期时间、SAN、有效期和固定文件路径
 - 支持正常续期检查、显式确认后的强制续期及 acme.sh 更新
 
@@ -76,8 +80,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/eutopiazen/ip-cert-acme/main
 5. 检查本机 TCP 80。
 6. 建议先向 Let’s Encrypt staging 环境测试签发。
 7. 向生产环境申请正式证书。
-8. 询问固定证书目录和服务重载命令。
-9. 验证证书 SAN、有效期、cron 和下次续期信息。
+8. 询问固定证书目录，并交互配置一个或多个部署目标。
+9. 安装部署分发器并把它注册为 acme.sh 的续期成功钩子。
+10. 验证证书 SAN、有效期、cron、部署目标和下次续期信息。
 
 默认固定路径：
 
@@ -87,6 +92,46 @@ bash <(curl -fsSL https://raw.githubusercontent.com/eutopiazen/ip-cert-acme/main
 ```
 
 私钥权限为 `600`，证书链权限为 `644`，目录权限为 `700`。
+
+部署配置与程序位置：
+
+```text
+/usr/local/sbin/ip-cert-acme
+/etc/ip-cert-acme/targets.conf
+/var/lib/ip-cert-acme/backups/
+```
+
+`targets.conf` 由脚本使用 shell 安全转义生成，权限为 `root:root 0600`。续期钩子
+只读取该配置；如果文件所有者或写权限不安全，部署会拒绝执行。
+
+## 1Panel 面板与网站
+
+配置部署目标时选择 `1) 自动添加 1Panel 面板`。脚本通过以下能力进行识别，
+不会判断或写死 1Panel 版本号：
+
+- 系统中存在 `1pctl`
+- 常见安装根目录下存在配对的 `secret/server.crt` 和 `secret/server.key`
+- 自动发现失败或发现多组时，由用户确认实际目录
+
+续期成功后，分发器会把统一证书复制到 1Panel 实际证书路径，验证文件、执行
+`1pctl restart`；如果重启失败，会恢复该目标的旧证书。
+
+选择 `2) 选择 1Panel 网站` 时，脚本只列出实际存在的站点证书目录并逐个确认，
+不会默认把 IP 证书部署到所有网站。选中网站后会检测 OpenResty/Nginx 容器，
+先运行 `nginx -t`，通过后再执行平滑重载。
+
+域名网站应使用包含相应域名 SAN 的域名证书。只有确实通过目标公网 IP 访问的
+网站才应选择这个 IP 证书。
+
+## 从 1.0 升级
+
+已经成功签发的用户不需要重新申请证书：
+
+1. 下载新版脚本并运行。
+2. 选择菜单 `8) 配置/重配多目标部署与自动重载`。
+3. 添加 1Panel 面板及其他确实需要的目标。
+4. 保存后，脚本会重新执行 `acme.sh --install-cert`，绑定新的部署钩子并立即
+   测试一次部署。
 
 ## 服务配置示例
 
@@ -99,10 +144,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/eutopiazen/ip-cert-acme/main
 /etc/ssl/ip-cert/privkey.pem
 ```
 
-重载命令选择：
+部署目标选择：
 
 ```text
-systemctl restart x-ui
+添加 x-ui
 ```
 
 ### Nginx
@@ -112,10 +157,10 @@ ssl_certificate     /etc/ssl/ip-cert/fullchain.pem;
 ssl_certificate_key /etc/ssl/ip-cert/privkey.pem;
 ```
 
-重载命令：
+部署目标：
 
 ```text
-systemctl reload nginx
+添加 Nginx
 ```
 
 ## 验证自动续期
@@ -128,6 +173,8 @@ systemctl reload nginx
 - `Le_RealFullChainPath` 和 `Le_RealKeyPath` 指向固定路径
 - SAN 包含目标 IP
 - 证书与私钥文件非空
+- `/usr/local/sbin/ip-cert-acme` 存在且可执行
+- 部署目标列表与实际使用者一致
 
 菜单 `5` 只执行正常 cron 检查；未到续期窗口会安全跳过。菜单 `6` 会强制创建
 新订单并消耗 CA 速率限额，因此要求输入 `RENEW` 二次确认。
@@ -152,6 +199,7 @@ crontab -l | grep acme.sh
 /root/.acme.sh/acme.sh --info -d 203.0.113.10 --ecc
 /root/.acme.sh/acme.sh --cron --home /root/.acme.sh --debug 2
 openssl x509 -in /etc/ssl/ip-cert/fullchain.pem -noout -dates -ext subjectAltName
+/usr/local/sbin/ip-cert-acme --deploy
 ```
 
 请将示例 IP `203.0.113.10` 替换为你的公网 IP。
@@ -159,8 +207,10 @@ openssl x509 -in /etc/ssl/ip-cert/fullchain.pem -noout -dates -ext subjectAltNam
 ## 安全边界
 
 该脚本以 root 运行并会：安装 apt 软件包、安装/更新 acme.sh、写入
-`/etc/ssl/ip-cert`、写入 `/etc/ip-cert-acme.conf`、修改 root crontab，并在
-证书更新后执行用户确认的重载命令。运行前请审阅源码。
+`/etc/ssl/ip-cert`、`/etc/ip-cert-acme.conf`、`/etc/ip-cert-acme/targets.conf`
+和 `/usr/local/sbin/ip-cert-acme`，修改 root crontab，并在证书更新后以 root
+执行用户确认的部署及重载命令。目标旧证书备份保存在
+`/var/lib/ip-cert-acme/backups/`。运行前请审阅源码。
 
 ## License
 
