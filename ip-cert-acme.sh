@@ -2,10 +2,15 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 DEFAULT_CERT_DIR="/etc/ssl/ip-cert"
 DEFAULT_RENEW_DAYS="4"
 STATE_FILE="/etc/ip-cert-acme.conf"
+CONFIG_DIR="/etc/ip-cert-acme"
+TARGETS_FILE="${CONFIG_DIR}/targets.conf"
+BACKUP_DIR="/var/lib/ip-cert-acme/backups"
+RUNTIME_SCRIPT="/usr/local/sbin/ip-cert-acme"
+DEPLOY_COMMAND="${RUNTIME_SCRIPT} --deploy"
 
 if test -t 1; then
     C_RED='\033[0;31m'
@@ -44,6 +49,9 @@ confirm() {
 
 require_root() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行此脚本。"
+}
+
+require_tty() {
     test -t 0 || die "此脚本需要交互式终端。请先下载，再使用 bash 执行；不要使用 curl | bash。"
 }
 
@@ -51,6 +59,21 @@ ROOT_HOME="$(getent passwd 0 2>/dev/null | awk -F: '{print $6}' || true)"
 ROOT_HOME="${ROOT_HOME:-/root}"
 ACME_HOME="${ROOT_HOME}/.acme.sh"
 ACME_BIN="${ACME_HOME}/acme.sh"
+
+TARGET_TYPES=()
+TARGET_NAMES=()
+TARGET_CERT_PATHS=()
+TARGET_KEY_PATHS=()
+TARGET_RELOAD_COMMANDS=()
+
+add_target() {
+    [[ $# -eq 5 ]] || return 1
+    TARGET_TYPES+=("$1")
+    TARGET_NAMES+=("$2")
+    TARGET_CERT_PATHS+=("$3")
+    TARGET_KEY_PATHS+=("$4")
+    TARGET_RELOAD_COMMANDS+=("$5")
+}
 
 detect_os() {
     [[ -r /etc/os-release ]] || die "无法读取 /etc/os-release。当前仅支持 Debian/Ubuntu。"
@@ -266,41 +289,427 @@ issue_production() {
     info "正式证书签发成功。"
 }
 
-choose_reload_command() {
+reset_target_arrays() {
+    TARGET_TYPES=()
+    TARGET_NAMES=()
+    TARGET_CERT_PATHS=()
+    TARGET_KEY_PATHS=()
+    TARGET_RELOAD_COMMANDS=()
+}
+
+ensure_deploy_layout() {
+    install -d -m 700 "$CONFIG_DIR" "$BACKUP_DIR"
+}
+
+install_runtime_script() {
+    local source_script="${BASH_SOURCE[0]}"
+    [[ -r "$source_script" ]] || { error "无法读取当前脚本：$source_script"; return 1; }
+    if [[ -e "$RUNTIME_SCRIPT" ]] \
+        && [[ "$(readlink -f "$source_script")" == "$(readlink -f "$RUNTIME_SCRIPT")" ]]; then
+        chmod 700 "$RUNTIME_SCRIPT"
+        return 0
+    fi
+    install -D -m 700 "$source_script" "$RUNTIME_SCRIPT"
+    info "部署分发器已安装：$RUNTIME_SCRIPT"
+}
+
+load_targets() {
+    local owner=""
+    local mode=""
+    reset_target_arrays
+    [[ -s "$TARGETS_FILE" ]] || return 0
+
+    owner="$(stat -c '%u' "$TARGETS_FILE" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$TARGETS_FILE" 2>/dev/null || true)"
+    [[ "$owner" == "0" ]] || { error "$TARGETS_FILE 必须归 root 所有。"; return 1; }
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || { error "无法确认 $TARGETS_FILE 的权限。"; return 1; }
+    (( (8#$mode & 022) == 0 )) || { error "$TARGETS_FILE 不能允许组或其他用户写入。"; return 1; }
+
+    # 配置文件仅由本脚本以 root:root 0600 和 shell 转义后的参数生成。
+    # shellcheck disable=SC1090
+    . "$TARGETS_FILE"
+}
+
+show_deploy_targets() {
+    local i=0
+    load_targets || return 1
+    printf '\n已配置的部署目标：\n'
+    if ((${#TARGET_TYPES[@]} == 0)); then
+        printf '  （无）\n'
+        return 0
+    fi
+    for i in "${!TARGET_TYPES[@]}"; do
+        printf '  %d) %s [%s]\n' "$((i + 1))" "${TARGET_NAMES[$i]}" "${TARGET_TYPES[$i]}"
+        if [[ "${TARGET_TYPES[$i]}" == "copy" ]]; then
+            printf '     证书：%s\n' "${TARGET_CERT_PATHS[$i]}"
+            printf '     私钥：%s\n' "${TARGET_KEY_PATHS[$i]}"
+        fi
+        printf '     命令：%s\n' "${TARGET_RELOAD_COMMANDS[$i]}"
+    done
+}
+
+validate_certificate_pair() {
+    local cert_file="$1"
+    local key_file="$2"
+    local cert_pub=""
+    local key_pub=""
+
+    [[ -s "$cert_file" && -s "$key_file" ]] || return 1
+    openssl x509 -in "$cert_file" -noout >/dev/null 2>&1 || return 1
+    openssl pkey -in "$key_file" -noout >/dev/null 2>&1 || return 1
+    cert_pub="$(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | sha256sum | awk '{print $1}')"
+    key_pub="$(openssl pkey -in "$key_file" -pubout -outform DER 2>/dev/null \
+        | sha256sum | awk '{print $1}')"
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
+}
+
+run_target_command() {
+    local name="$1"
+    local command_text="$2"
+    info "执行部署目标命令 [${name}]：${command_text}"
+    bash -c "$command_text"
+}
+
+deploy_copy_target() {
+    local name="$1"
+    local cert_path="$2"
+    local key_path="$3"
+    local reload_command="$4"
+    local source_cert="${CERT_DIR}/fullchain.pem"
+    local source_key="${CERT_DIR}/privkey.pem"
+    local cert_dir=""
+    local key_dir=""
+    local cert_tmp=""
+    local key_tmp=""
+    local cert_mode="600"
+    local key_mode="600"
+    local cert_owner="0:0"
+    local key_owner="0:0"
+    local safe_name=""
+    local target_backup_dir=""
+    local had_backup=0
+
+    [[ "$cert_path" == /* && "$key_path" == /* && "$cert_path" != "/" && "$key_path" != "/" ]] || {
+        error "部署目标路径必须是非根目录的绝对路径：$name"
+        return 1
+    }
+    cert_dir="$(dirname -- "$cert_path")"
+    key_dir="$(dirname -- "$key_path")"
+    [[ -d "$cert_dir" && -d "$key_dir" ]] || {
+        error "部署目标目录不存在：$name"
+        return 1
+    }
+
+    [[ -e "$cert_path" ]] && cert_mode="$(stat -c '%a' "$cert_path")" cert_owner="$(stat -c '%u:%g' "$cert_path")"
+    [[ -e "$key_path" ]] && key_mode="$(stat -c '%a' "$key_path")" key_owner="$(stat -c '%u:%g' "$key_path")"
+
+    safe_name="$(printf '%s' "$name" | tr -cs 'A-Za-z0-9._-' '_')"
+    target_backup_dir="${BACKUP_DIR}/${safe_name}/$(date '+%Y%m%d-%H%M%S')"
+    if [[ -s "$cert_path" && -s "$key_path" ]]; then
+        install -d -m 700 "$target_backup_dir"
+        cp -a -- "$cert_path" "${target_backup_dir}/certificate"
+        cp -a -- "$key_path" "${target_backup_dir}/private-key"
+        had_backup=1
+    fi
+
+    cert_tmp="$(mktemp "${cert_path}.tmp.XXXXXX")"
+    key_tmp="$(mktemp "${key_path}.tmp.XXXXXX")"
+    if ! install -m "$cert_mode" "$source_cert" "$cert_tmp" \
+        || ! install -m "$key_mode" "$source_key" "$key_tmp" \
+        || ! chown "$cert_owner" "$cert_tmp" \
+        || ! chown "$key_owner" "$key_tmp" \
+        || ! validate_certificate_pair "$cert_tmp" "$key_tmp"; then
+        rm -f -- "$cert_tmp" "$key_tmp"
+        error "准备部署文件失败：$name"
+        return 1
+    fi
+
+    mv -f -- "$cert_tmp" "$cert_path"
+    mv -f -- "$key_tmp" "$key_path"
+    if run_target_command "$name" "$reload_command"; then
+        info "部署成功：$name"
+        return 0
+    fi
+
+    error "重载失败，开始回滚：$name"
+    if ((had_backup)); then
+        cp -a -- "${target_backup_dir}/certificate" "$cert_path"
+        cp -a -- "${target_backup_dir}/private-key" "$key_path"
+        run_target_command "${name}（回滚后）" "$reload_command" || true
+    else
+        rm -f -- "$cert_path" "$key_path"
+    fi
+    return 1
+}
+
+deploy_targets() {
+    local i=0
+    local failures=0
+    load_state
+    ensure_deploy_layout
+    validate_certificate_pair "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem" || {
+        error "统一证书源不存在、格式无效或证书与私钥不匹配。"
+        return 1
+    }
+    load_targets || return 1
+
+    if ((${#TARGET_TYPES[@]} == 0)); then
+        warn "没有配置部署目标；统一证书源已更新，但没有服务被重载。"
+        return 0
+    fi
+
+    for i in "${!TARGET_TYPES[@]}"; do
+        case "${TARGET_TYPES[$i]}" in
+            copy)
+                deploy_copy_target \
+                    "${TARGET_NAMES[$i]}" \
+                    "${TARGET_CERT_PATHS[$i]}" \
+                    "${TARGET_KEY_PATHS[$i]}" \
+                    "${TARGET_RELOAD_COMMANDS[$i]}" || failures=$((failures + 1))
+                ;;
+            reload)
+                run_target_command "${TARGET_NAMES[$i]}" "${TARGET_RELOAD_COMMANDS[$i]}" \
+                    || failures=$((failures + 1))
+                ;;
+            *)
+                error "未知部署目标类型：${TARGET_TYPES[$i]}"
+                failures=$((failures + 1))
+                ;;
+        esac
+    done
+
+    if ((failures > 0)); then
+        error "${failures} 个部署目标失败。"
+        return 1
+    fi
+    info "全部部署目标处理完成。"
+}
+
+append_target_config() {
+    local file="$1"
+    shift
+    printf 'add_target %q %q %q %q %q\n' "$@" >>"$file"
+    add_target "$@"
+}
+
+discover_1panel_panel_dirs() {
+    local root=""
+    local cert=""
+    for root in /opt/1panel /usr/local/1panel /data/1panel; do
+        [[ -d "$root" ]] || continue
+        while IFS= read -r cert; do
+            [[ -f "${cert%/server.crt}/server.key" ]] && dirname -- "$cert"
+        done < <(find "$root" -maxdepth 4 -type f -path '*/secret/server.crt' -print 2>/dev/null)
+    done | sort -u
+}
+
+add_1panel_panel_target() {
+    local config_file="$1"
+    local panel_dir=""
+    local input=""
+    local dirs=()
+    local i=0
+
+    command -v 1pctl >/dev/null 2>&1 || {
+        warn "未找到 1pctl；可改用自定义文件目标。"
+        return 1
+    }
+    mapfile -t dirs < <(discover_1panel_panel_dirs)
+    if ((${#dirs[@]} == 1)); then
+        panel_dir="${dirs[0]}"
+        info "检测到 1Panel 面板证书目录：$panel_dir"
+    elif ((${#dirs[@]} > 1)); then
+        printf '检测到多个 1Panel 面板证书目录：\n'
+        for i in "${!dirs[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${dirs[$i]}"; done
+        read -r -p "请选择编号：" input
+        [[ "$input" =~ ^[0-9]+$ ]] && ((input >= 1 && input <= ${#dirs[@]})) || return 1
+        panel_dir="${dirs[$((input - 1))]}"
+    else
+        read -r -p "未自动发现，请输入 1Panel secret 目录（留空取消）：" panel_dir
+        [[ -n "$panel_dir" ]] || return 1
+    fi
+
+    [[ -f "${panel_dir}/server.crt" && -f "${panel_dir}/server.key" ]] || {
+        error "目录中缺少 server.crt 或 server.key：$panel_dir"
+        return 1
+    }
+    append_target_config "$config_file" copy "1Panel 面板" \
+        "${panel_dir}/server.crt" "${panel_dir}/server.key" "1pctl restart"
+}
+
+discover_1panel_site_certs() {
+    local root=""
+    local cert=""
+    for root in /opt/1panel /usr/local/1panel /data/1panel; do
+        [[ -d "$root" ]] || continue
+        while IFS= read -r cert; do
+            [[ -f "${cert%/fullchain.pem}/privkey.pem" ]] && printf '%s\n' "$cert"
+        done < <(find "$root" -maxdepth 8 -type f -path '*/www/sites/*/ssl/fullchain.pem' -print 2>/dev/null)
+    done | sort -u
+}
+
+detect_openresty_containers() {
+    command -v docker >/dev/null 2>&1 || return 0
+    docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null \
+        | awk -F'|' 'tolower($0) ~ /(openresty|nginx)/ {print $1}'
+}
+
+add_1panel_site_targets() {
+    local config_file="$1"
+    local cert=""
+    local site_name=""
+    local selected=0
+    local container=""
+    local input=""
+    local reload_command=""
+    local certs=()
+    local containers=()
+    local i=0
+
+    mapfile -t certs < <(discover_1panel_site_certs)
+    if ((${#certs[@]} == 0)); then
+        warn "未发现 1Panel 网站证书目录。"
+        return 1
+    fi
+
+    warn "只有通过该公网 IP 访问并且确实需要 IP 证书的网站才应选择。"
+    for cert in "${certs[@]}"; do
+        site_name="$(basename "$(dirname "$(dirname "$cert")")")"
+        if confirm "把 IP 证书同步到网站 ${site_name}？" "n"; then
+            append_target_config "$config_file" copy "1Panel 网站 ${site_name}" \
+                "$cert" "${cert%/fullchain.pem}/privkey.pem" ":"
+            selected=$((selected + 1))
+        fi
+    done
+    ((selected > 0)) || return 0
+
+    mapfile -t containers < <(detect_openresty_containers)
+    if ((${#containers[@]} == 1)); then
+        container="${containers[0]}"
+        info "检测到 OpenResty/Nginx 容器：$container"
+    elif ((${#containers[@]} > 1)); then
+        printf '检测到多个 OpenResty/Nginx 容器：\n'
+        for i in "${!containers[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${containers[$i]}"; done
+        read -r -p "请选择编号：" input
+        [[ "$input" =~ ^[0-9]+$ ]] && ((input >= 1 && input <= ${#containers[@]})) || return 1
+        container="${containers[$((input - 1))]}"
+    else
+        read -r -p "未检测到容器，请输入 OpenResty/Nginx 容器名（留空改用自定义命令）：" container
+    fi
+
+    if [[ -n "$container" ]]; then
+        printf -v reload_command 'docker exec -i %q nginx -t && docker exec -i %q nginx -s reload' \
+            "$container" "$container"
+    else
+        read -r -p "请输入网站服务检查并重载命令：" reload_command
+        [[ -n "$reload_command" ]] || return 1
+    fi
+    append_target_config "$config_file" reload "1Panel 网站服务" "" "" "$reload_command"
+}
+
+add_common_service_target() {
+    local config_file="$1"
+    local service_name="$2"
+    local action="$3"
+    command -v systemctl >/dev/null 2>&1 || { error "当前系统没有 systemctl。"; return 1; }
+    systemctl cat "$service_name" >/dev/null 2>&1 || {
+        error "未找到 systemd 服务：$service_name"
+        return 1
+    }
+    append_target_config "$config_file" reload "$service_name" "" "" \
+        "systemctl ${action} ${service_name}"
+}
+
+add_custom_copy_target() {
+    local config_file="$1"
+    local name=""
+    local cert_path=""
+    local key_path=""
+    local command_text=""
+    read -r -p "目标名称：" name
+    read -r -p "目标完整证书路径：" cert_path
+    read -r -p "目标私钥路径：" key_path
+    read -r -p "复制后执行的命令（不需要则填 :）：" command_text
+    [[ -n "$name" && "$cert_path" == /* && "$key_path" == /* && -n "$command_text" ]] || {
+        error "输入不完整或路径不是绝对路径。"
+        return 1
+    }
+    append_target_config "$config_file" copy "$name" "$cert_path" "$key_path" "$command_text"
+}
+
+add_custom_reload_target() {
+    local config_file="$1"
+    local name=""
+    local command_text=""
+    read -r -p "目标名称：" name
+    read -r -p "续期后执行的完整命令：" command_text
+    [[ -n "$name" && -n "$command_text" ]] || return 1
+    append_target_config "$config_file" reload "$name" "" "" "$command_text"
+}
+
+configure_deploy_targets() {
     local choice=""
-    local custom=""
+    local temp_file=""
+    ensure_deploy_layout
+    install_runtime_script || return 1
+    temp_file="$(mktemp "${CONFIG_DIR}/targets.conf.XXXXXX")"
+    chmod 600 "$temp_file"
+    reset_target_arrays
 
-    printf '\n续期成功后，需要让使用证书的软件重新加载文件：\n'
-    printf '  1) 重启 x-ui\n'
-    printf '  2) 重载 Nginx\n'
-    printf '  3) 重载 Caddy\n'
-    printf '  4) 重载 Apache2\n'
-    printf '  5) 输入自定义命令\n'
-    printf '  6) 暂不重载（仅复制证书）\n'
-    read -r -p "请选择 [1-6]：" choice
+    if [[ -s "$TARGETS_FILE" ]] && confirm "保留现有部署目标并继续添加？" "y"; then
+        cp -- "$TARGETS_FILE" "$temp_file"
+        chmod 600 "$temp_file"
+        # 临时加载现有配置以便显示。
+        local saved_targets_file="$TARGETS_FILE"
+        TARGETS_FILE="$temp_file"
+        load_targets || { TARGETS_FILE="$saved_targets_file"; rm -f -- "$temp_file"; return 1; }
+        TARGETS_FILE="$saved_targets_file"
+    fi
 
-    case "$choice" in
-        1) RELOAD_COMMAND="systemctl restart x-ui" ;;
-        2) RELOAD_COMMAND="systemctl reload nginx" ;;
-        3) RELOAD_COMMAND="systemctl reload caddy" ;;
-        4) RELOAD_COMMAND="systemctl reload apache2" ;;
-        5)
-            read -r -p "请输入完整命令（将以 root 身份在每次续期后执行）：" custom
-            [[ -n "$custom" ]] || { error "自定义命令不能为空。"; return 1; }
-            RELOAD_COMMAND="$custom"
-            ;;
-        6)
-            RELOAD_COMMAND=":"
-            warn "未设置服务重载。以后必须补充，否则服务可能继续使用旧证书。"
-            ;;
-        *)
-            error "选项无效。"
-            return 1
-            ;;
-    esac
+    while true; do
+        printf '\n配置证书部署目标（可添加多个）：\n'
+        printf '  1) 自动添加 1Panel 面板\n'
+        printf '  2) 选择 1Panel 网站\n'
+        printf '  3) 添加 x-ui\n'
+        printf '  4) 添加 Nginx\n'
+        printf '  5) 添加 Caddy\n'
+        printf '  6) 添加 Apache2\n'
+        printf '  7) 添加自定义文件目标\n'
+        printf '  8) 添加自定义重载命令\n'
+        printf '  9) 查看当前目标\n'
+        printf '  0) 保存并结束\n'
+        read -r -p "请选择 [0-9]：" choice
+        case "$choice" in
+            1) add_1panel_panel_target "$temp_file" || warn "未添加 1Panel 面板。" ;;
+            2) add_1panel_site_targets "$temp_file" || warn "未添加 1Panel 网站。" ;;
+            3) add_common_service_target "$temp_file" x-ui restart || true ;;
+            4) add_common_service_target "$temp_file" nginx reload || true ;;
+            5) add_common_service_target "$temp_file" caddy reload || true ;;
+            6) add_common_service_target "$temp_file" apache2 reload || true ;;
+            7) add_custom_copy_target "$temp_file" || warn "未添加自定义文件目标。" ;;
+            8) add_custom_reload_target "$temp_file" || warn "未添加自定义命令。" ;;
+            9)
+                printf '\n当前待保存目标：\n'
+                local i=0
+                for i in "${!TARGET_TYPES[@]}"; do
+                    printf '  %d) %s [%s]\n' "$((i + 1))" "${TARGET_NAMES[$i]}" "${TARGET_TYPES[$i]}"
+                done
+                ;;
+            0) break ;;
+            *) warn "无效选项。" ;;
+        esac
+    done
 
-    info "续期后执行：${RELOAD_COMMAND}"
-    confirm "确认使用该命令？" "y"
+    if ((${#TARGET_TYPES[@]} == 0)) && ! confirm "没有部署目标，仍然保存？" "n"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+    mv -f -- "$temp_file" "$TARGETS_FILE"
+    chmod 600 "$TARGETS_FILE"
+    info "部署目标已保存：$TARGETS_FILE"
+    show_deploy_targets
 }
 
 write_state() {
@@ -327,11 +736,23 @@ install_certificate_files() {
         return 1
     }
 
-    choose_reload_command || return 1
+    if [[ -s "$TARGETS_FILE" ]]; then
+        show_deploy_targets || return 1
+        if confirm "继续使用以上部署目标？" "y"; then
+            install_runtime_script || return 1
+        else
+            configure_deploy_targets || return 1
+        fi
+    else
+        configure_deploy_targets || return 1
+    fi
+    RELOAD_COMMAND="$DEPLOY_COMMAND"
 
     install -d -m 700 "$cert_dir"
     [[ -e "${cert_dir}/privkey.pem" ]] || install -m 600 /dev/null "${cert_dir}/privkey.pem"
     [[ -e "${cert_dir}/fullchain.pem" ]] || install -m 644 /dev/null "${cert_dir}/fullchain.pem"
+    # 部署钩子在 acme.sh 写入证书后立即执行，因此必须先记录统一证书源路径。
+    write_state "$cert_dir" "$RELOAD_COMMAND"
 
     set +e
     install_output="$("$ACME_BIN" --install-cert \
@@ -364,11 +785,56 @@ install_certificate_files() {
     openssl x509 -in "${cert_dir}/fullchain.pem" -noout -subject -issuer -dates -ext subjectAltName
 }
 
+rebind_deploy_hook() {
+    local output=""
+    local rc=0
+    load_state
+    [[ -x "$ACME_BIN" ]] || { error "尚未安装 acme.sh。"; return 1; }
+    [[ -n "$PRIMARY_IP" ]] || { error "未找到已保存的证书 IP。"; return 1; }
+    [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]] || {
+        error "固定证书路径不存在，请先完成正式签发。"
+        return 1
+    }
+    install_runtime_script || return 1
+
+    set +e
+    output="$("$ACME_BIN" --install-cert \
+        -d "$PRIMARY_IP" \
+        --ecc \
+        --force \
+        --key-file "${CERT_DIR}/privkey.pem" \
+        --fullchain-file "${CERT_DIR}/fullchain.pem" \
+        --reloadcmd "$DEPLOY_COMMAND" 2>&1)"
+    rc=$?
+    set -e
+    printf '%s\n' "$output"
+    if ((rc != 0)); then
+        error "重新绑定部署钩子或立即部署失败。"
+        return "$rc"
+    fi
+
+    RELOAD_COMMAND="$DEPLOY_COMMAND"
+    write_state "$CERT_DIR" "$RELOAD_COMMAND"
+    info "acme.sh 已绑定多目标部署钩子。"
+}
+
+configure_and_rebind_targets() {
+    configure_deploy_targets || return 1
+    rebind_deploy_hook
+}
+
 load_state() {
+    local owner=""
+    local mode=""
     PRIMARY_IP=""
     CERT_DIR="$DEFAULT_CERT_DIR"
     RELOAD_COMMAND=""
     if [[ -r "$STATE_FILE" ]]; then
+        owner="$(stat -c '%u' "$STATE_FILE" 2>/dev/null || true)"
+        mode="$(stat -c '%a' "$STATE_FILE" 2>/dev/null || true)"
+        [[ "$owner" == "0" ]] || { error "$STATE_FILE 必须归 root 所有。"; return 1; }
+        [[ "$mode" =~ ^[0-7]{3,4}$ ]] || { error "无法确认 $STATE_FILE 的权限。"; return 1; }
+        (( (8#$mode & 022) == 0 )) || { error "$STATE_FILE 不能允许组或其他用户写入。"; return 1; }
         # 文件由本脚本以 root:root 0600 创建。
         # shellcheck disable=SC1090
         . "$STATE_FILE"
@@ -412,6 +878,10 @@ show_status() {
         printf '\n固定路径证书：%s\n' "${CERT_DIR}/fullchain.pem"
         openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -subject -issuer -dates -ext subjectAltName
     fi
+
+    printf '\n部署分发器：%s\n' "$RUNTIME_SCRIPT"
+    [[ -x "$RUNTIME_SCRIPT" ]] || warn "部署分发器尚未安装或不可执行。"
+    show_deploy_targets || warn "无法读取部署目标。"
 
     if port_80_in_use; then
         printf '\n'
@@ -478,16 +948,18 @@ show_menu() {
     printf '  5) 立即运行一次正常续期检查\n'
     printf '  6) 强制续期（谨慎）\n'
     printf '  7) 更新 acme.sh\n'
+    printf '  8) 配置/重配多目标部署与自动重载\n'
     printf '  0) 退出\n\n'
 }
 
 main() {
     require_root
+    require_tty
 
     while true; do
         local choice=""
         show_menu
-        read -r -p "请选择 [0-7]：" choice
+        read -r -p "请选择 [0-8]：" choice
         case "$choice" in
             1) full_wizard || warn "流程未完成，请根据上方提示处理后重试。"; pause ;;
             2)
@@ -512,10 +984,18 @@ main() {
             5) run_renewal_check || true; pause ;;
             6) force_renew || true; pause ;;
             7) update_acme || true; pause ;;
+            8) configure_and_rebind_targets || warn "部署目标配置或绑定未完成。"; pause ;;
             0) exit 0 ;;
             *) warn "无效选项。"; sleep 1 ;;
         esac
     done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [[ "${1:-}" == "--deploy" ]]; then
+        require_root
+        deploy_targets
+        exit $?
+    fi
+    main "$@"
+fi
